@@ -90,7 +90,7 @@ License: MIT (see `LICENSE`).
 
 **参考与致谢**：
 
-- **TargetBridge**（MIT）：借用了虚拟屏私有 API 的声明，参考了 HiDPI 模式的选取方法。
+- **TargetBridge**（MIT）：借用了虚拟屏私有 API 的声明，参考了 HiDPI 模式的选取方法；顺带发现的 HEVC 误报问题已提交上游 PR #232。
 - **Chromium**：TargetBridge 那份 API 声明的原始出处。
 - **RetinaRelay**（商业闭源）：借鉴了两个思路，「传 GPU 压缩纹理而不是视频」和「由接收端本机光标绘制鼠标」。没有用到它的任何代码。
 - **BC7 规范**：编码器按 Khronos BPTC 规范和微软的 BC7 文档编写。
