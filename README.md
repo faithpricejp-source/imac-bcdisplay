@@ -62,7 +62,7 @@ cursor position/image at 120 Hz (separate connection) ►  GPU samples BC7 nativ
 
 ## Credits and references
 
-- **[TargetBridge](https://github.com/swellweb/targetBridge)** by Marco Caciotti (MIT). The `CGVirtualDisplay` declarations in `Sender/Bridging.h` are copied from its bridging header (license reproduced in `LICENSE`). Its way of picking the HiDPI virtual display mode by backing pixels guided `VirtualDisplay.selectHiDPIMode`. This project started from trying TargetBridge on a 2014 iMac and measuring why it lagged there; the fix for its HEVC capability probe went upstream as a separate PR.
+- **[TargetBridge](https://github.com/swellweb/targetBridge)** by Marco Caciotti (MIT). The `CGVirtualDisplay` declarations in `Sender/Bridging.h` are copied from its bridging header (license reproduced in `LICENSE`). Its way of picking the HiDPI virtual display mode by backing pixels guided `VirtualDisplay.selectHiDPIMode`. This project started from trying TargetBridge on a 2014 iMac and measuring why it lagged there; a fix for its HEVC capability probe was offered upstream as [swellweb/targetBridge#232](https://github.com/swellweb/targetBridge/pull/232).
 - **Chromium** `virtual_display_mac_util.mm`: TargetBridge verified its `CGVirtualDisplay` declarations against it.
 - **[RetinaRelay](https://www.retinarelay.com/)** (commercial, closed source): the *idea* of sending GPU-compressed textures (it shows "BC7 mode 6") instead of video, and of drawing the pointer with the receiver's own cursor. Both come from its public product page and app UI. No code was used, and none is available.
 - **BC7 / BPTC format**: encoder written from the Khronos Data Format Specification (BPTC) and Microsoft's BC7 format documentation (mode 6 bit layout, 4-bit index weights).
