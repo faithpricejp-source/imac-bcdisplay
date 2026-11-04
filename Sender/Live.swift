@@ -47,13 +47,12 @@ final class VirtualDisplay {
         slog("WARNING: HiDPI mode not found for virtual display")
     }
 
-    /// Place the virtual display directly left of the main display, top-aligned.
-    func placeLeftOfMain() {
+    /// Place the virtual display directly right of the main display, top-aligned.
+    func placeRightOfMain() {
         let main = CGDisplayBounds(CGMainDisplayID())
-        let me = CGDisplayBounds(id)
         var cfg: CGDisplayConfigRef?
         CGBeginDisplayConfiguration(&cfg)
-        CGConfigureDisplayOrigin(cfg, id, Int32(main.minX - me.width), Int32(main.minY))
+        CGConfigureDisplayOrigin(cfg, id, Int32(main.maxX), Int32(main.minY))
         let r = CGCompleteDisplayConfiguration(cfg, .forSession)
         slog("placed virtual display at \(CGDisplayBounds(id)) (r=\(r.rawValue))")
     }
@@ -63,6 +62,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     let fs: FrameSender
     let dev: MTLDevice
     var stream: SCStream?
+    var onStop: (() -> Void)?
     var texCache: CVMetalTextureCache?
     let outQ = DispatchQueue(label: "bcd.capture", qos: .userInteractive)
     var frames = 0, idle = 0
@@ -119,7 +119,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    func stream(_ stream: SCStream, didStopWithError error: Error) { slog("capture stopped: \(error)") }
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        slog("capture stopped: \(error)")
+        DispatchQueue.main.async { self.onStop?() }
+    }
 }
 
 /// Sends the system cursor's position/image (only while it is on the virtual display) at 120 Hz.
@@ -186,9 +189,12 @@ final class Controller {
     let cur: CursorSender
     var vd: VirtualDisplay?
     var cap: Capture?
+    var screensSleeping = false
+    var captureRetryWork: DispatchWorkItem?
     var endpoint: NWEndpoint?
     var browser: NWBrowser?
     var frameUp = false, cursorUp = false, connectingFrames = false, connectingCursor = false
+    var connectTimeouts = 0
     var teardownWork: DispatchWorkItem?
     let mainRotation = CGDisplayRotation(CGMainDisplayID())
     var mainPlacerSpec: String?
@@ -229,9 +235,20 @@ final class Controller {
         cur.start()
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            slog("screens did sleep"); self?.fs.q.async { self?.fs.conn?.send(.displaySleep, Data()) } }
+            guard let self else { return }
+            slog("screens did sleep")
+            self.screensSleeping = true
+            self.stopCapture()
+            self.fs.q.async { self.fs.conn?.send(.displaySleep, Data()) }
+        }
         nc.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            slog("screens did wake"); self?.fs.q.async { self?.fs.conn?.send(.displayWake, Data()) } }
+            guard let self else { return }
+            slog("screens did wake")
+            self.screensSleeping = false
+            self.fs.q.async { self.fs.conn?.send(.displayWake, Data()) }
+            self.connectAll()   // no-op if up or an attempt is in flight
+            self.ensureSession()
+        }
     }
 
     func connectAll() { connectFrames(); connectCursor() }
@@ -249,6 +266,15 @@ final class Controller {
         c.onClose = { [weak self] why in DispatchQueue.main.async {
             guard let self else { return }
             slog("frame connection down: \(why)")
+            // Seen 2026-11-04: a Time Machine snapshot unmount made nehelper treat this bundle ID as
+            // uninstalled; the live process then got "Local network prohibited" on every path while the
+            // connection itself sat in .preparing forever (nehelper had the grant cached again within ~1 s,
+            // but the stuck attempt never re-asked). The timeout makes fresh attempts; if they keep failing,
+            // relaunching (verified to recover) is the last resort.
+            if why.hasPrefix("connect timeout") {
+                self.connectTimeouts += 1
+                if self.connectTimeouts >= 3 { slog("\(self.connectTimeouts) connect timeouts in a row; exiting so launchd relaunches"); exit(6) }
+            } else { self.connectTimeouts = 0 }
             self.connectingFrames = false
             let wasUp = self.frameUp
             self.frameUp = false
@@ -256,9 +282,9 @@ final class Controller {
             if wasUp { self.scheduleTeardown() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.connectFrames() }
         }}
-        c.start { [weak self] in DispatchQueue.main.async {
+        c.start(connectTimeout: 5) { [weak self] in DispatchQueue.main.async {
             guard let self else { return }
-            self.connectingFrames = false; self.frameUp = true
+            self.connectingFrames = false; self.frameUp = true; self.connectTimeouts = 0
             slog("frame connection up")
             self.teardownWork?.cancel(); self.teardownWork = nil
             self.ensureSession()
@@ -276,7 +302,7 @@ final class Controller {
             self.cur.q.async { if self.cur.conn === c { self.cur.conn = nil } }
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.connectCursor() }
         }}
-        c.start { [weak self] in DispatchQueue.main.async {
+        c.start(connectTimeout: 5) { [weak self] in DispatchQueue.main.async {
             guard let self else { return }
             self.connectingCursor = false; self.cursorUp = true
             c.onMessage = { _, _ in }
@@ -288,7 +314,8 @@ final class Controller {
     var captureAllowed = false
     var probing = false
     func ensureSession() {
-        if vd != nil || probing { return }
+        guard frameUp, !screensSleeping, !probing else { return }
+        if vd != nil { ensureCapture(); return }
         // Don't put up a black virtual display while we can't capture; wait for the Screen Recording grant.
         // CGPreflightScreenCaptureAccess() proved unreliable here, so probe ScreenCaptureKit itself.
         if !captureAllowed {
@@ -306,18 +333,49 @@ final class Controller {
         }
         guard let v = VirtualDisplay(pointsW: pointsW, pointsH: pointsH, name: "iMac 5K (bcd)") else { slog("cannot create virtual display"); return }
         vd = v
-        v.placeLeftOfMain()
+        v.placeRightOfMain()
         cur.q.async { self.cur.displayID = v.id }
+        ensureCapture()
+        checkMainRotation()
+    }
+
+    func ensureCapture() {
+        guard frameUp, !screensSleeping, cap == nil, let v = vd else { return }
+        captureRetryWork?.cancel(); captureRetryWork = nil
         let c = Capture(fs: fs, dev: dev)
         cap = c
+        c.onStop = { [weak self, weak c] in
+            guard let self, let c, self.cap === c else { return }
+            self.cap = nil
+            guard self.frameUp, !self.screensSleeping, self.vd != nil else { return }
+            slog("capture interrupted; retrying in 1s")
+            let retry = DispatchWorkItem { [weak self] in self?.ensureCapture() }
+            self.captureRetryWork = retry
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: retry)
+        }
         Task {
-            do { try await c.start(displayID: v.id, width: self.pointsW * 2, height: self.pointsH * 2) }
+            do {
+                try await c.start(displayID: v.id, width: self.pointsW * 2, height: self.pointsH * 2)
+                let stillCurrent = await MainActor.run { self.cap === c }
+                // Sleep/disconnect can invalidate a start while ScreenCaptureKit is still awaiting it.
+                if !stillCurrent, let s = c.stream { try? await s.stopCapture() }
+            }
             catch {
-                // a fresh TCC grant is often only honoured after relaunch; launchd restarts us (non-zero exit)
-                slog("capture failed: \(error); exiting so launchd relaunches"); exit(5)
+                await MainActor.run {
+                    guard self.cap === c else { return }
+                    // A fresh TCC grant may require a relaunch. Ignore failures from retired captures.
+                    slog("capture failed: \(error); exiting so launchd relaunches"); exit(5)
+                }
             }
         }
-        checkMainRotation()
+    }
+
+    func stopCapture() {
+        captureRetryWork?.cancel(); captureRetryWork = nil
+        let c = cap
+        cap = nil
+        c?.onStop = nil
+        if let s = c?.stream { Task { try? await s.stopCapture() } }
     }
 
     func scheduleTeardown() {
@@ -331,8 +389,7 @@ final class Controller {
     func teardown() {
         guard let v = vd else { return }
         slog("removing virtual display \(v.id)")
-        if let s = cap?.stream { Task { try? await s.stopCapture() } }
-        cap = nil
+        stopCapture()
         vd = nil
         fs.q.async { self.fs.hasContent = false }
         cur.q.async { self.cur.displayID = 0 }

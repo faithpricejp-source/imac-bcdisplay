@@ -231,6 +231,27 @@ final class Receiver: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) { log("drawable \(size)") }
 
     func dump(_ conn: MsgConn) {
+        let px = readback()
+        let h = px.withUnsafeBytes { fnvRGB($0) }
+        log("dump fnv=\(String(h, radix: 16))")
+        var w = Writer(); w.u64(h); conn.send(.dumpRes, w.d)
+    }
+
+    /// Debug: `kill -USR1 <pid>` writes the current decoded texture to ~/Library/Logs/bcd/snap.png.
+    func snapshotPNG() {
+        var px = readback()
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        let img = px.withUnsafeMutableBytes { b -> CGImage? in
+            CGContext(data: b.baseAddress, width: texW, height: texH, bitsPerComponent: 8, bytesPerRow: texW * 4,
+                      space: cs, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)?.makeImage()
+        }
+        guard let img, let png = NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:]) else { log("snapshot failed"); return }
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/bcd/snap.png")
+        try? png.write(to: url)
+        log("snapshot written \(texW)x\(texH)")
+    }
+
+    func readback() -> [UInt8] {
         lastCB?.waitUntilCompleted()
         let od = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: texW, height: texH, mipmapped: false)
         od.usage = [.shaderWrite]; od.storageMode = .managed
@@ -243,9 +264,7 @@ final class Receiver: NSObject, MTKViewDelegate {
         cb.commit(); cb.waitUntilCompleted()
         var px = [UInt8](repeating: 0, count: texW * texH * 4)
         px.withUnsafeMutableBytes { o.getBytes($0.baseAddress!, bytesPerRow: texW * 4, from: MTLRegionMake2D(0, 0, texW, texH), mipmapLevel: 0) }
-        let h = px.withUnsafeBytes { fnvRGB($0) }
-        log("dump fnv=\(String(h, radix: 16))")
-        var w = Writer(); w.u64(h); conn.send(.dumpRes, w.d)
+        return px
     }
 
     // MARK: cursor (hardware cursor of this Mac, driven by the sender)
@@ -280,9 +299,14 @@ final class Receiver: NSObject, MTKViewDelegate {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let r = Receiver()
+    var snapSource: DispatchSourceSignal?
     var window: NSWindow?
     var noSleep: IOPMAssertionID = 0
     var hasNoSleep = false
+    var userActivity: IOPMAssertionID = 0
+    var wakeCheck: DispatchWorkItem?
+    var userSessionActive = true
+    var sessionRestore: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let screen = NSScreen.screens[0]
@@ -317,7 +341,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         r.setup(width: w, height: h, pointsW: pw, pointsH: ph)
         if let v = r.view { log("drawable \(v.drawableSize)") }
         r.listen()
+        signal(SIGUSR1, SIG_IGN)
+        let usr1 = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+        usr1.setEventHandler { [weak self] in self?.r.snapshotPNG() }
+        usr1.resume(); snapSource = usr1
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.resumeUserSession("session active")
+        }
+        workspace.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.suspendUserSession()
+        }
+        let distributed = DistributedNotificationCenter.default()
+        distributed.addObserver(forName: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.resumeUserSession("screen unlocked")
+        }
+        distributed.addObserver(forName: NSNotification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.suspendUserSession()
+        }
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.r.logStats() }
+    }
+
+    func suspendUserSession() {
+        userSessionActive = false
+        sessionRestore?.cancel(); sessionRestore = nil
+    }
+
+    func resumeUserSession(_ reason: String) {
+        userSessionActive = true
+        restoreSession(reason)
+    }
+
+    func restoreSession(_ reason: String) {
+        sessionRestore?.cancel()
+        let restore = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.sessionRestore = nil
+            guard self.userSessionActive, self.r.active, !headless else { return }
+            self.activate()
+            self.r.view?.draw()
+            log("restored stream window after \(reason): visible=\(self.window?.isVisible ?? false)")
+        }
+        sessionRestore = restore
+        // Let loginwindow finish giving the user's GUI session back before ordering our window.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: restore)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        restoreSession("reopen")
+        return true
     }
 
     func takeNoSleep(_ on: Bool) {
@@ -331,6 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func activate() {
+        guard userSessionActive else { return }
         log("session active: taking over the screen")
         wakeDisplay()
         if !windowed {
@@ -338,12 +411,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             CGAssociateMouseAndMouseCursorPosition(0)   // local mouse must not fight the remote cursor
         }
         NSApp.setActivationPolicy(.regular)
+        NSApp.unhide(nil)
+        window?.deminiaturize(nil)
+        // above every local app window (e.g. a remote-desktop client window that comes forward), so nothing on the iMac
+        // can cover the stream — that hid the Mac Studio Dock at the bottom edge (2026-11-03)
+        if !windowed { window?.level = .screenSaver }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.logWindowStack() }
+    }
+
+    /// Debug: where our window really is, and which on-screen windows sit at or above it.
+    func logWindowStack() {
+        guard let win = window else { return }
+        log("window frame=\(win.frame) level=\(win.level.rawValue) screen=\(win.screen?.frame ?? .zero) visible=\(win.screen?.visibleFrame ?? .zero)")
+        let l = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        for w in l.prefix(15) {
+            let b = (w[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) } ?? .zero
+            log("  win layer=\(w[kCGWindowLayer as String] ?? "-") owner=\(w[kCGWindowOwnerName as String] ?? "-") bounds=\(b)")
+        }
     }
 
     func deactivate() {
         log("session ended: giving the screen back")
+        sessionRestore?.cancel(); sessionRestore = nil
+        cancelWake()
         window?.orderOut(nil)
         NSApp.presentationOptions = []
         CGAssociateMouseAndMouseCursorPosition(1)
@@ -353,15 +445,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func sleepDisplay() {
         log("sender screens asleep: sleeping display")
+        cancelWake()
         takeNoSleep(false)
         let wrangler = IORegistryEntryFromPath(kIOMasterPortDefault, "IOService:/IOResources/IODisplayWrangler")
         if wrangler != 0 { IORegistryEntrySetCFProperty(wrangler, "IORequestIdle" as CFString, kCFBooleanTrue); IOObjectRelease(wrangler) }
     }
 
     func wakeDisplay() {
-        var act: IOPMAssertionID = 0
-        IOPMAssertionDeclareUserActivity("bcd-receiver wake" as CFString, kIOPMUserActiveLocal, &act)
+        wakeCheck?.cancel()
+        declareActivity()
         takeNoSleep(true)
+        // IORequestIdle is asynchronous: a preceding sleep can finish AFTER the first wake.
+        // Verify the physical panel rather than treating GPU frame completion as display wake.
+        checkWake(remaining: 20)
+    }
+
+    func declareActivity() {
+        let result = IOPMAssertionDeclareUserActivity("bcd-receiver wake" as CFString,
+                                                    kIOPMUserActiveLocal, &userActivity)
+        if result != kIOReturnSuccess { log("display wake request failed: \(result)") }
+    }
+
+    func checkWake(remaining: Int) {
+        let check = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let wrangler = IORegistryEntryFromPath(kIOMasterPortDefault, "IOService:/IOResources/IODisplayWrangler")
+            var state: Int?
+            if wrangler != 0 {
+                let properties = IORegistryEntryCreateCFProperty(wrangler, "IOPowerManagement" as CFString,
+                                                                kCFAllocatorDefault, 0)?.takeRetainedValue() as? [String: Any]
+                state = properties?["CurrentPowerState"] as? Int
+                IOObjectRelease(wrangler)
+            }
+            if let state, state < 4 { self.declareActivity() }
+            if remaining > 1 { self.checkWake(remaining: remaining - 1) }
+            else {
+                self.wakeCheck = nil
+                log("display wake verification: power=\(state.map(String.init) ?? "unknown")")
+            }
+        }
+        wakeCheck = check
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: check)
+    }
+
+    func cancelWake() {
+        wakeCheck?.cancel(); wakeCheck = nil
+        if userActivity != 0 { IOPMAssertionRelease(userActivity); userActivity = 0 }
     }
 
     func applicationWillTerminate(_ n: Notification) {
@@ -380,4 +509,7 @@ appItem.submenu = appMenu
 app.mainMenu = menu
 let delegate = AppDelegate()
 app.delegate = delegate
+#if RECEIVER_SESSION_TEST
+scheduleReceiverSessionTests(app: app, delegate: delegate)
+#endif
 app.run()

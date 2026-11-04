@@ -85,11 +85,19 @@ final class MsgConn {
         return p
     }
 
-    func start(onReady: (() -> Void)? = nil) {
+    /// `connectTimeout`: give up if not ready by then. A `.service` endpoint whose Bonjour record can't be
+    /// resolved (e.g. across Mac sleep) otherwise sits in `.preparing` forever and never reports failure.
+    func start(connectTimeout: TimeInterval? = nil, onReady: (() -> Void)? = nil) {
+        var ready = false
+        if let t = connectTimeout {
+            queue.asyncAfter(deadline: .now() + t) { [weak self] in
+                if !ready { self?.close("connect timeout after \(Int(t))s") }
+            }
+        }
         conn.stateUpdateHandler = { [weak self] st in
             guard let self else { return }
             switch st {
-            case .ready: onReady?(); self.readHeader()
+            case .ready: ready = true; onReady?(); self.readHeader()
             case .failed(let e): self.close("failed: \(e)")
             case .cancelled: self.close("cancelled")
             case .waiting(let e): self.close("waiting: \(e)")

@@ -186,6 +186,9 @@ final class FrameSender {
                             self.bestRtt == .max ? -1 : Double(self.bestRtt) / 1e6))
             }
             self.sFrames = 0; self.sTiles = 0; self.sWire = 0; self.sLat = []; self.sAckRtt = []
+            // re-derive the clock offset each window: the two Macs' clocks drift ~20 ppm, so a frozen offset
+            // made capture→gpudone creep from ~13 ms to 400+ ms over a few hours (2026-11-04)
+            self.bestRtt = .max
         }
     }
 }
